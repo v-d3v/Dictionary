@@ -1,85 +1,87 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.Http;
 using System.Threading.Tasks;
-using System.Web.Script.Serialization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using NAudio.Wave;
 
 namespace Dictionary
 {
     public partial class MainWindow : Window
     {
-        // HttpClient — инструмент для HTTP-запросов в интернет
-        // static readonly = создаётся один раз за всё время работы программы
-        private static readonly HttpClient _http = new HttpClient();
+        // сервис для работы с API — вынесен в отдельный класс
+        private DictionaryService _service = new DictionaryService();
 
-        // ссылка на MP3 с произношением. null = ещё не получена
+        // ссылка на аудио произношения
         private string _audioUrl = null;
 
-        // список последних поисковых запросов (максимум 5)
-        private readonly List<string> _history = new List<string>();
+        // история поиска
+        private List<string> _history = new List<string>();
 
         public MainWindow()
         {
             InitializeComponent();
-
-            // заголовок запроса — представляем наше приложение серверу
-            // без него некоторые API могут отклонить запрос
-            _http.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-            _http.DefaultRequestHeaders.Add("Accept", "application/json");
-            _http.Timeout = TimeSpan.FromSeconds(10);
         }
 
         // нажата кнопка "Найти"
-        private void SearchButton_Click(object sender, RoutedEventArgs e) =>
-            _ = SearchWordAsync();
+        private void SearchButton_Click(object sender, RoutedEventArgs e)
+        {
+            _ = SearchWordAsync(WordInput.Text.Trim());
+        }
 
-        // нажата клавиша в поле ввода — запускаем поиск только если это Enter
+        // нажат Enter в поле ввода
         private void WordInput_KeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key == Key.Enter)
-                _ = SearchWordAsync();
+                _ = SearchWordAsync(WordInput.Text.Trim());
         }
 
-        // двойной клик по слову в истории — вставляем его в поле и ищем
+        // нажата кнопка "Случайное слово" — используем второй API
+        private async void RandomButton_Click(object sender, RoutedEventArgs e)
+        {
+            StatusBar.Text = "Получаем случайное слово...";
+            try
+            {
+                string randomWord = await _service.GetRandomWordAsync();
+                WordInput.Text = randomWord;
+                await SearchWordAsync(randomWord);
+            }
+            catch (Exception ex)
+            {
+                StatusBar.Text = "Ошибка: " + ex.Message;
+            }
+        }
+
+        // двойной клик по слову в истории — повторяем поиск
         private void HistoryList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
         {
             if (HistoryList.SelectedItem is string word)
             {
                 WordInput.Text = word;
-                _ = SearchWordAsync();
+                _ = SearchWordAsync(word);
             }
         }
 
-        // нажата кнопка "Очистить" историю
+        // очищаем историю
         private void ClearHistory_Click(object sender, RoutedEventArgs e)
         {
             _history.Clear();
             HistoryList.ItemsSource = null;
         }
 
-        // основной метод поиска
-        // async/await — ждём ответа от сервера не замораживая окно
-        private async Task SearchWordAsync()
+        // главный метод — ищем слово и показываем результат
+        private async Task SearchWordAsync(string word)
         {
-            string word = WordInput.Text.Trim();
-
             if (string.IsNullOrEmpty(word))
             {
                 StatusBar.Text = "Введите слово для поиска.";
                 return;
             }
 
-            if (word.Length > 50)
-            {
-                StatusBar.Text = "Слишком длинный запрос (максимум 50 символов).";
-                return;
-            }
-
-            // готовим интерфейс к новому поиску
             StatusBar.Text = "Поиск...";
             ResultPanel.Children.Clear();
             PlayButton.IsEnabled = false;
@@ -87,115 +89,99 @@ namespace Dictionary
 
             try
             {
-                // формируем адрес запроса
-                string url = $"https://api.dictionaryapi.dev/api/v2/entries/en/{Uri.EscapeDataString(word)}";
+                // обращаемся к сервису — он делает запрос к API
+                WordResult result = await _service.GetWordAsync(word);
 
-                // отправляем запрос, получаем JSON-строку в ответ
-                string json = await _http.GetStringAsync(url);
+                // показываем слово и транскрипцию
+                AddHeader(result.Word + "   " + result.Phonetic);
 
-                // превращаем JSON-строку в объекты C#
-                dynamic data = new JavaScriptSerializer().DeserializeObject(json);
-                var entries = (object[])data;
-                var entry = (Dictionary<string, object>)entries[0];
-
-                // достаём слово и транскрипцию
-                string headword = entry.ContainsKey("word")
-                    ? entry["word"].ToString() : word;
-                string phonetic = entry.ContainsKey("phonetic")
-                    ? entry["phonetic"].ToString() : "";
-
-                // ищем ссылку на MP3 с произношением
-                if (entry.ContainsKey("phonetics"))
+                // показываем все определения
+                int num = 1;
+                foreach (DefinitionItem def in result.Definitions)
                 {
-                    foreach (var ph in (object[])entry["phonetics"])
-                    {
-                        var phDict = (Dictionary<string, object>)ph;
-                        if (phDict.ContainsKey("audio") &&
-                            !string.IsNullOrEmpty(phDict["audio"].ToString()))
-                        {
-                            _audioUrl = phDict["audio"].ToString();
-                            if (!_audioUrl.StartsWith("http"))
-                                _audioUrl = "https:" + _audioUrl;
-                            break;
-                        }
-                    }
+                    AddSubHeader(num + ". " + def.PartOfSpeech);
+                    AddDefinition("    " + def.Definition);
+
+                    if (!string.IsNullOrEmpty(def.Example))
+                        AddExample("    Пример: \"" + def.Example + "\"");
+
+                    num++;
                 }
 
-                // выводим заголовок
-                AddHeader($"{headword}   {phonetic}");
-
-                // обходим все значения слова (noun, verb, adjective и т.д.)
-                if (entry.ContainsKey("meanings"))
+                // сохраняем ссылку на аудио если есть
+                if (!string.IsNullOrEmpty(result.AudioUrl))
                 {
-                    int meaningNum = 1;
-                    foreach (var m in (object[])entry["meanings"])
-                    {
-                        var mDict = (Dictionary<string, object>)m;
-                        string partOfSpeech = mDict.ContainsKey("partOfSpeech")
-                            ? mDict["partOfSpeech"].ToString() : "";
-
-                        AddSubHeader($"{meaningNum}. {partOfSpeech}");
-
-                        if (mDict.ContainsKey("definitions"))
-                        {
-                            int defNum = 1;
-                            foreach (var d in (object[])mDict["definitions"])
-                            {
-                                var dDict = (Dictionary<string, object>)d;
-
-                                string def = dDict.ContainsKey("definition")
-                                    ? dDict["definition"].ToString() : "";
-                                string example = dDict.ContainsKey("example")
-                                    ? dDict["example"].ToString() : "";
-
-                                AddDefinition($"   {defNum}. {def}");
-
-                                if (!string.IsNullOrEmpty(example))
-                                    AddExample($"      Пример: \"{example}\"");
-
-                                defNum++;
-                            }
-                        }
-                        meaningNum++;
-                    }
+                    _audioUrl = result.AudioUrl;
+                    PlayButton.IsEnabled = true;
                 }
 
-                // включаем кнопку звука если нашли ссылку
-                PlayButton.IsEnabled = _audioUrl != null;
-                StatusBar.Text = $"Найдено: \"{headword}\"";
+                StatusBar.Text = "Найдено: " + result.Word;
 
-                // обновляем историю — без дубликатов, максимум 5 слов
-                if (!_history.Contains(headword))
+                // добавляем в историю без дубликатов
+                if (!_history.Contains(result.Word))
                 {
-                    _history.Insert(0, headword);
+                    _history.Insert(0, result.Word);
                     if (_history.Count > 5)
                         _history.RemoveAt(5);
                 }
+
                 HistoryList.ItemsSource = null;
                 HistoryList.ItemsSource = _history;
             }
             catch (HttpRequestException ex) when (ex.Message.Contains("404"))
             {
-                // 404 = слово не найдено в словаре, это не баг программы
-                AddError($"Слово \"{word}\" не найдено. Проверьте написание.");
+                AddError("Слово \"" + word + "\" не найдено. Проверьте написание.");
                 StatusBar.Text = "Не найдено.";
             }
             catch (Exception ex)
             {
-                // любая другая ошибка: нет интернета, сервер недоступен и т.д.
-                AddError($"Ошибка: {ex.Message}");
+                AddError("Ошибка: " + ex.Message);
                 StatusBar.Text = "Произошла ошибка.";
             }
         }
 
-        // открывает произношение в браузере
-        private void PlayAudioButton_Click(object sender, RoutedEventArgs e)
+        // воспроизводим произношение прямо в приложении через NAudio
+        private async void PlayAudioButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_audioUrl != null)
-                System.Diagnostics.Process.Start(_audioUrl);
+            if (_audioUrl == null) return;
+
+            StatusBar.Text = "Загрузка аудио...";
+            PlayButton.IsEnabled = false;
+
+            try
+            {
+                // скачиваем MP3 в память
+                using (var http = new HttpClient())
+                {
+                    byte[] audioData = await http.GetByteArrayAsync(_audioUrl);
+
+                    // воспроизводим через NAudio
+                    using (var ms = new MemoryStream(audioData))
+                    using (var reader = new Mp3FileReader(ms))
+                    using (var output = new WaveOutEvent())
+                    {
+                        output.Init(reader);
+                        output.Play();
+
+                        // ждём пока закончится воспроизведение
+                        while (output.PlaybackState == PlaybackState.Playing)
+                            await Task.Delay(100);
+                    }
+                }
+
+                StatusBar.Text = "Найдено: " + WordInput.Text;
+            }
+            catch (Exception ex)
+            {
+                StatusBar.Text = "Ошибка воспроизведения: " + ex.Message;
+            }
+            finally
+            {
+                PlayButton.IsEnabled = true;
+            }
         }
 
-        // вспомогательные методы
+        // методы для вывода текста разных стилей
 
         private void AddHeader(string text)
         {
