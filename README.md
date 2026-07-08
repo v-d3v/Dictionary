@@ -17,7 +17,7 @@ WPF-приложение на C# (.NET Framework 4.8) для поиска опр
 
 ## Как запустить
 
-1. Открыть `Dictionary.sln` в Visual Studio
+1. Открыть `Dictionary.slnx` в Visual Studio
 2. Нажать F5
 
 ## Автор - Компанеев Иван Андреевич
